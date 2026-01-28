@@ -278,6 +278,60 @@ file_handler.setFormatter(formatter)
 # Add the file handler to the token usage logger
 token_logger.addHandler(file_handler)
 
+# Prevent token_logger from propagating to root logger (avoid duplicate logs)
+token_logger.propagate = False
+
+# Helper function to log token usage in plain text format
+def log_token_usage(model, subaccount_name, prompt_tokens, completion_tokens,
+                    total_tokens, user_id=None, ip_address=None, is_streaming=False,
+                    duration_ms=None, request_id=None, error=None):
+    """Log token usage in plain text format.
+
+    Args:
+        model: Model name used
+        subaccount_name: SubAccount that handled the request
+        prompt_tokens: Number of prompt tokens
+        completion_tokens: Number of completion tokens
+        total_tokens: Total tokens used
+        user_id: User/auth token (already truncated)
+        ip_address: Client IP address
+        is_streaming: Whether this was a streaming request
+        duration_ms: Request duration in milliseconds
+        request_id: Unique request identifier (not logged, kept for compatibility)
+        error: Error message if request failed
+    """
+    # Use provided user_id and ip_address, or defaults
+    if user_id is None:
+        user_id = "unknown"
+    if ip_address is None:
+        ip_address = "unknown"
+
+    # Build log message in original format with optional enhancements
+    log_parts = [
+        f"User: {user_id}",
+        f"IP: {ip_address}",
+        f"Model: {model}",
+        f"SubAccount: {subaccount_name}",
+        f"PromptTokens: {prompt_tokens}",
+        f"CompletionTokens: {completion_tokens}",
+        f"TotalTokens: {total_tokens}"
+    ]
+
+    # Add optional duration
+    if duration_ms is not None:
+        log_parts.append(f"Duration: {duration_ms}ms")
+
+    # Add streaming indicator
+    if is_streaming:
+        log_parts.append("(Streaming)")
+
+    # Add error if present
+    if error:
+        log_parts.append(f"Error: {error}")
+
+    # Log in original comma-separated format
+    token_logger.info(", ".join(log_parts))
+
 # Global variables for token management
 token = None
 token_expiry = 0
@@ -1972,7 +2026,11 @@ def proxy_openai_stream():
 @app.route('/v1/messages', methods=['POST'])
 def proxy_claude_request():
     """Handles requests that are compatible with the Anthropic Claude Messages API using SAP AI SDK."""
-    logging.info("Received request to /v1/messages")
+    # Track request timing and ID for logging
+    start_time = time.time()
+    request_id = f"{int(start_time * 1000)}-{random.randint(1000, 9999)}"
+
+    logging.info(f"[{request_id}] Received request to /v1/messages")
     logging.debug(f"Request headers: {request.headers}")
     logging.debug(f"Request body:\n{json.dumps(request.get_json(), indent=4)}")
 
@@ -2188,7 +2246,13 @@ def proxy_claude_request():
             )
         else:
             logging.info("No max_tokens specified after adjustment for model %s", model)
-        
+
+        # Remove output_config which is not supported by AWS Bedrock
+        if "output_config" in body:
+            output_config = body.pop("output_config")
+            logging.info(f"[{request_id}] Removed unsupported output_config field from request: {json.dumps(output_config)}")
+            logging.info(f"[{request_id}] Note: AWS Bedrock doesn't support output_config/json_schema format constraints")
+
         # Convert body to JSON string for Bedrock API
         body_json = json.dumps(body)
         
@@ -2201,19 +2265,45 @@ def proxy_claude_request():
         logging.info("Request body for Bedrock (pretty):\n%s", pretty_body_json)
 
         if stream:
+            # Extract user info for logging (before generator context)
+            auth_header = request.headers.get("Authorization", "unknown")
+            user_id = f"{auth_header[:20]}..." if auth_header and len(auth_header) > 20 else auth_header
+            ip_address = request.remote_addr or request.headers.get("X-Forwarded-For", "unknown")
+
             # Handle streaming response
             def stream_generate():
+                prompt_tokens = 0
+                completion_tokens = 0
+                total_tokens = 0
+
                 try:
                     response = bedrock.invoke_model_with_response_stream(body=body_json)
                     response_body = response.get("body")
-                    
+
                     if response_body is not None:
                         for event in response_body:
                             chunk = json.loads(event["chunk"]["bytes"])
                             logging.debug(f"Streaming chunk: {chunk}")
-                            
+
                             chunk_type = chunk.get("type")
-                            
+
+                            # Extract token usage from message_delta chunks
+                            if chunk_type == "message_delta":
+                                usage = chunk.get("usage", {})
+                                if usage:
+                                    completion_tokens = usage.get("output_tokens", completion_tokens)
+                                    logging.debug(f"[{request_id}] Extracted tokens from message_delta: completion={completion_tokens}")
+
+                            # Extract token usage from message_start chunks
+                            elif chunk_type == "message_start":
+                                message = chunk.get("message", {})
+                                usage = message.get("usage", {})
+                                if usage:
+                                    prompt_tokens = usage.get("input_tokens", 0)
+                                    completion_tokens = usage.get("output_tokens", 0)
+                                    total_tokens = prompt_tokens + completion_tokens
+                                    logging.debug(f"[{request_id}] Extracted tokens from message_start: prompt={prompt_tokens}, completion={completion_tokens}, total={total_tokens}")
+
                             # Handle different chunk types according to Claude streaming format
                             if chunk_type == "message_start":
                                 yield f"event: message_start\ndata: {json.dumps(chunk, ensure_ascii=False)}\n\n"
@@ -2229,7 +2319,28 @@ def proxy_claude_request():
                                 yield f"event: message_stop\ndata: {json.dumps(chunk, ensure_ascii=False)}\n\n"
                                 yield "data: [DONE]\n\n"
                                 break
-                                
+
+                    # Calculate final total if not set
+                    if total_tokens == 0:
+                        total_tokens = prompt_tokens + completion_tokens
+
+                    # Calculate request duration
+                    duration_ms = int((time.time() - start_time) * 1000)
+
+                    # Log token usage at the end of stream
+                    log_token_usage(
+                        model=model,
+                        subaccount_name=subaccount_name,
+                        prompt_tokens=prompt_tokens,
+                        completion_tokens=completion_tokens,
+                        total_tokens=total_tokens,
+                        user_id=user_id,
+                        ip_address=ip_address,
+                        is_streaming=True,
+                        duration_ms=duration_ms,
+                        request_id=request_id
+                    )
+
                 except Exception as e:
                     logging.error(f"Error in streaming response: {e}", exc_info=True)
                     error_chunk = {
@@ -2257,6 +2368,36 @@ def proxy_claude_request():
                 if chunk_data:
                     final_response = json.loads(chunk_data)
                     logging.debug(f"Non-streaming response: {final_response}")
+
+                    # Extract token usage
+                    usage = final_response.get("usage", {})
+                    prompt_tokens = usage.get("input_tokens", 0)
+                    completion_tokens = usage.get("output_tokens", 0)
+                    total_tokens = prompt_tokens + completion_tokens
+                    logging.info(f"[{request_id}] Non-streaming token usage - prompt={prompt_tokens}, completion={completion_tokens}, total={total_tokens}")
+
+                    # Calculate request duration
+                    duration_ms = int((time.time() - start_time) * 1000)
+
+                    # Extract user info for logging
+                    auth_header = request.headers.get("Authorization", "unknown")
+                    user_id = f"{auth_header[:20]}..." if auth_header and len(auth_header) > 20 else auth_header
+                    ip_address = request.remote_addr or request.headers.get("X-Forwarded-For", "unknown")
+
+                    # Log token usage
+                    log_token_usage(
+                        model=model,
+                        subaccount_name=subaccount_name,
+                        prompt_tokens=prompt_tokens,
+                        completion_tokens=completion_tokens,
+                        total_tokens=total_tokens,
+                        user_id=user_id,
+                        ip_address=ip_address,
+                        is_streaming=False,
+                        duration_ms=duration_ms,
+                        request_id=request_id
+                    )
+
                     return jsonify(final_response), 200
                 else:
                     return jsonify({}), 200
@@ -2395,10 +2536,13 @@ def handle_non_streaming_request(url, headers, payload, model, subaccount_name):
         Flask response with the API result
     """
     response = None  # Initialize for cleanup in finally block
+    start_time = time.time()  # Track request duration
+    request_id = f"{int(start_time * 1000)}-{random.randint(1000, 9999)}"  # Generate unique request ID
+
     try:
         # Log the raw request body and payload being forwarded
-        logging.info(f"Raw request received (non-streaming): {json.dumps(request.json, indent=2)}")
-        logging.info(f"Forwarding payload to API (non-streaming): {json.dumps(payload, indent=2)}")
+        logging.info(f"[{request_id}] Raw request received (non-streaming): {json.dumps(request.json, indent=2)}")
+        logging.info(f"[{request_id}] Forwarding payload to API (non-streaming): {json.dumps(payload, indent=2)}")
 
         # Make request to backend API using session
         response = _http_session.post(url, headers=headers, json=payload, timeout=600)
@@ -2417,15 +2561,29 @@ def handle_non_streaming_request(url, headers, payload, model, subaccount_name):
         total_tokens = final_response.get("usage", {}).get("total_tokens", 0)
         prompt_tokens = final_response.get("usage", {}).get("prompt_tokens", 0)
         completion_tokens = final_response.get("usage", {}).get("completion_tokens", 0)
-        
-        # Log token usage with subAccount information
-        user_id = request.headers.get("Authorization", "unknown")
-        if user_id and len(user_id) > 20:
-            user_id = f"{user_id[:20]}..."
-        ip_address = request.remote_addr or request.headers.get("X-Forwarded-For", "unknown_ip")
-        token_logger.info(f"User: {user_id}, IP: {ip_address}, Model: {model}, SubAccount: {subaccount_name}, "
-                          f"PromptTokens: {prompt_tokens}, CompletionTokens: {completion_tokens}, TotalTokens: {total_tokens}")
-        
+
+        # Calculate request duration
+        duration_ms = int((time.time() - start_time) * 1000)
+
+        # Extract user info for logging
+        auth_header = request.headers.get("Authorization", "unknown")
+        user_id = f"{auth_header[:20]}..." if auth_header and len(auth_header) > 20 else auth_header
+        ip_address = request.remote_addr or request.headers.get("X-Forwarded-For", "unknown")
+
+        # Log token usage with structured format
+        log_token_usage(
+            model=model,
+            subaccount_name=subaccount_name,
+            prompt_tokens=prompt_tokens,
+            completion_tokens=completion_tokens,
+            total_tokens=total_tokens,
+            user_id=user_id,
+            ip_address=ip_address,
+            is_streaming=False,
+            duration_ms=duration_ms,
+            request_id=request_id
+        )
+
         return jsonify(final_response), 200
     
     except requests.exceptions.HTTPError as err:
@@ -2454,23 +2612,34 @@ def handle_non_streaming_request(url, headers, payload, model, subaccount_name):
 
 def generate_streaming_response(url, headers, payload, model, subaccount_name):
     """Generate streaming response from backend API.
-    
+
     Args:
         url: Backend API endpoint URL
         headers: Request headers
         payload: Request payload
         model: Model name
         subaccount_name: Name of the selected subAccount
-    
+
     Yields:
         SSE formatted response chunks
     """
+    # Track request timing
+    start_time = time.time()
+    request_id = f"{int(start_time * 1000)}-{random.randint(1000, 9999)}"
+
+    # Extract user info for logging (before generator context)
+    auth_header = request.headers.get("Authorization", "unknown")
+    user_id = f"{auth_header[:20]}..." if auth_header and len(auth_header) > 20 else auth_header
+    ip_address = request.remote_addr or request.headers.get("X-Forwarded-For", "unknown")
+
     # Log the raw request body and payload being forwarded
-    logging.info(f"Raw request received (streaming): {json.dumps(request.json, indent=2)}")
-    logging.info(f"Forwarding payload to API (streaming): {json.dumps(payload, indent=2)}")
-    
+    logging.info(f"[{request_id}] Raw request received (streaming): {json.dumps(request.json, indent=2)}")
+    logging.info(f"[{request_id}] Forwarding payload to API (streaming): {json.dumps(payload, indent=2)}")
+
     buffer = ""
     total_tokens = 0
+    prompt_tokens = 0  # Initialize prompt tokens
+    completion_tokens = 0  # Initialize completion tokens
     claude_metadata = {}  # For Claude 3.7 metadata
     chunk = None  # Initialize chunk variable to avoid reference errors
 
@@ -2635,18 +2804,23 @@ def generate_streaming_response(url, headers, payload, model, subaccount_name):
                             except Exception:
                                 pass
             
+            # Calculate request duration
+            duration_ms = int((time.time() - start_time) * 1000)
+
             # Log token usage at the end of the stream
-            user_id = request.headers.get("Authorization", "unknown")
-            if user_id and len(user_id) > 20:
-                user_id = f"{user_id[:20]}..."
-            ip_address = request.remote_addr or request.headers.get("X-Forwarded-For", "unknown_ip")
-            
-            # Log with subAccount information
-            token_logger.info(f"User: {user_id}, IP: {ip_address}, Model: {model}, SubAccount: {subaccount_name}, "
-                             f"PromptTokens: {prompt_tokens if 'prompt_tokens' in locals() else 0}, "
-                             f"CompletionTokens: {completion_tokens if 'completion_tokens' in locals() else 0}, "
-                             f"TotalTokens: {total_tokens} (Streaming)")
-            
+            log_token_usage(
+                model=model,
+                subaccount_name=subaccount_name,
+                prompt_tokens=prompt_tokens,
+                completion_tokens=completion_tokens,
+                total_tokens=total_tokens,
+                user_id=user_id,
+                ip_address=ip_address,
+                is_streaming=True,
+                duration_ms=duration_ms,
+                request_id=request_id
+            )
+
             # Standard stream end
             yield "data: [DONE]\n\n"
             
