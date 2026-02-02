@@ -28,11 +28,138 @@ from gen_ai_hub.proxy.native.amazon.clients import Session
 from ai_core_sdk.ai_core_v2_client import AICoreV2Client
 _original_from_env = AICoreV2Client.from_env
 
+# Global variables to store extracted configuration for SDK use
+_extracted_base_url = None
+_extracted_auth_credentials = None
+
+def _extract_base_url_from_proxy_config():
+    """Extract base_url from proxy configuration deployment URLs."""
+    global _extracted_base_url
+    
+    if _extracted_base_url:
+        return _extracted_base_url
+    
+    try:
+        # Look for a base_url from the first available subaccount's deployment URLs
+        for subaccount in proxy_config.subaccounts.values():
+            # Get deployment URLs from the subaccount
+            deployment_urls = []
+            for urls in subaccount.deployment_models.values():
+                if urls:
+                    deployment_urls.extend(urls)
+
+            if deployment_urls:
+                # Extract base URL from deployment URL
+                # Deployment URL format: https://api.ai.xxx.cfapps.sap.hana.ondemand.com/v2/inference/deployments/xxx
+                # We need: https://api.ai.xxx.cfapps.sap.hana.ondemand.com/v2
+                deployment_url = deployment_urls[0]
+                if '/inference/' in deployment_url:
+                    _extracted_base_url = deployment_url.split('/inference/')[0]
+                    logging.info(f"Extracted base_url from deployment URL: {_extracted_base_url}")
+                    return _extracted_base_url
+    except Exception as e:
+        logging.debug(f"Could not extract base_url from proxy config (might not be initialized yet): {e}")
+    
+    return None
+
+def _extract_auth_credentials_from_proxy_config():
+    """Extract authentication credentials from proxy configuration service keys."""
+    global _extracted_auth_credentials
+    
+    if _extracted_auth_credentials:
+        return _extracted_auth_credentials
+    
+    try:
+        # Get credentials from the first available subaccount's service key
+        for subaccount in proxy_config.subaccounts.values():
+            if subaccount.service_key:
+                _extracted_auth_credentials = {
+                    'auth_url': subaccount.service_key.url,
+                    'client_id': subaccount.service_key.clientid,
+                    'client_secret': subaccount.service_key.clientsecret
+                }
+                logging.info(f"Extracted auth credentials from subaccount '{subaccount.name}' service key")
+                return _extracted_auth_credentials
+    except Exception as e:
+        logging.debug(f"Could not extract auth credentials from proxy config (might not be initialized yet): {e}")
+    
+    return None
+
 @staticmethod
 def _patched_from_env(profile_name: str = None, **kwargs):
-    """Patched version of from_env that filters out unsupported 'client_type' parameter."""
+    """Patched version of from_env that filters out unsupported 'client_type' parameter
+    and injects base_url and authentication credentials from proxy configuration if not already provided."""
     # Remove client_type from kwargs as it's not supported in ai_core_sdk 2.6.2
     kwargs.pop('client_type', None)
+
+    # Inject base_url from proxy configuration if not already provided
+    if 'base_url' not in kwargs:
+        # First try to get from proxy config
+        base_url = _extract_base_url_from_proxy_config()
+        
+        if base_url:
+            kwargs['base_url'] = base_url
+            logging.info(f"Injected base_url from proxy config: {base_url}")
+        else:
+            # If proxy config doesn't have it, try to read from ~/.aicore/config.json
+            try:
+                import os
+                aicore_config_path = os.path.expanduser("~/.aicore/config.json")
+                if os.path.exists(aicore_config_path):
+                    with open(aicore_config_path, 'r') as f:
+                        aicore_config = json.load(f)
+                        if 'AICORE_BASE_URL' in aicore_config:
+                            kwargs['base_url'] = aicore_config['AICORE_BASE_URL']
+                            logging.info(f"Injected base_url from ~/.aicore/config.json: {kwargs['base_url']}")
+            except Exception as e:
+                logging.warning(f"Failed to read base_url from ~/.aicore/config.json: {e}")
+
+    # If still no base_url, log a warning
+    if 'base_url' not in kwargs:
+        logging.warning("No base_url available - SDK initialization may fail")
+
+    # Inject authentication credentials from proxy configuration if not already provided
+    # The SDK needs: auth_url, client_id, and client_secret for authentication
+    auth_params_missing = 'auth_url' not in kwargs or 'client_id' not in kwargs or 'client_secret' not in kwargs
+    
+    if auth_params_missing:
+        # First try to get from proxy config
+        auth_creds = _extract_auth_credentials_from_proxy_config()
+        
+        if auth_creds:
+            if 'auth_url' not in kwargs and auth_creds.get('auth_url'):
+                kwargs['auth_url'] = auth_creds['auth_url']
+                logging.info(f"Injected auth_url from proxy config")
+            if 'client_id' not in kwargs and auth_creds.get('client_id'):
+                kwargs['client_id'] = auth_creds['client_id']
+                logging.info(f"Injected client_id from proxy config")
+            if 'client_secret' not in kwargs and auth_creds.get('client_secret'):
+                kwargs['client_secret'] = auth_creds['client_secret']
+                logging.info(f"Injected client_secret from proxy config")
+        else:
+            # If proxy config doesn't have it, try to read from ~/.aicore/config.json
+            try:
+                import os
+                aicore_config_path = os.path.expanduser("~/.aicore/config.json")
+                if os.path.exists(aicore_config_path):
+                    with open(aicore_config_path, 'r') as f:
+                        aicore_config = json.load(f)
+                        if 'auth_url' not in kwargs and 'AICORE_AUTH_URL' in aicore_config:
+                            kwargs['auth_url'] = aicore_config['AICORE_AUTH_URL']
+                            logging.info(f"Injected auth_url from ~/.aicore/config.json")
+                        if 'client_id' not in kwargs and 'AICORE_CLIENT_ID' in aicore_config:
+                            kwargs['client_id'] = aicore_config['AICORE_CLIENT_ID']
+                            logging.info(f"Injected client_id from ~/.aicore/config.json")
+                        if 'client_secret' not in kwargs and 'AICORE_CLIENT_SECRET' in aicore_config:
+                            kwargs['client_secret'] = aicore_config['AICORE_CLIENT_SECRET']
+                            logging.info(f"Injected client_secret from ~/.aicore/config.json")
+            except Exception as e:
+                logging.warning(f"Failed to read auth credentials from ~/.aicore/config.json: {e}")
+
+    # Log warning if authentication credentials are still missing
+    if 'auth_url' not in kwargs or 'client_id' not in kwargs or 'client_secret' not in kwargs:
+        logging.warning("Authentication credentials (auth_url, client_id, client_secret) may be missing - SDK initialization may fail")
+
     return _original_from_env(profile_name=profile_name, **kwargs)
 
 AICoreV2Client.from_env = _patched_from_env
@@ -2190,11 +2317,59 @@ def proxy_claude_request():
         # Add required anthropic_version for Bedrock
         body["anthropic_version"] = "bedrock-2023-05-31"
 
-        # Remove unsupported fields for Bedrock (e.g., context_management)
-        if "context_management" in body:
-            body.pop("context_management", None)
-            logging.info("Removed unsupported field 'context_management' from request body")
+        # Remove unsupported fields for Bedrock (e.g., context_management, output_config)
+        unsupported_bedrock_fields = ["context_management", "output_config"]
+        for field in unsupported_bedrock_fields:
+            if field in body:
+                body.pop(field, None)
+                logging.info(f"Removed unsupported field '{field}' from request body")
+
+        # =====================================================================
+        # CRITICAL FIX: Strip cache_control fields from messages and system
+        # Claude Code sends cache_control fields that Bedrock doesn't support
+        # Error: "system.2.cache_control.ephemeral.scope: Extra inputs are not permitted"
+        # =====================================================================
+        def strip_cache_control(obj):
+            """Recursively strip cache_control fields from dicts and lists."""
+            if isinstance(obj, dict):
+                # Remove cache_control key if present
+                obj.pop("cache_control", None)
+                # Recursively process all values
+                for key, value in list(obj.items()):
+                    obj[key] = strip_cache_control(value)
+                return obj
+            elif isinstance(obj, list):
+                return [strip_cache_control(item) for item in obj]
+            else:
+                return obj
         
+        # Strip cache_control from system field (can be string or list of dicts)
+        if "system" in body:
+            original_system = body["system"]
+            body["system"] = strip_cache_control(body["system"])
+            if original_system != body["system"]:
+                logging.info(f"[{request_id}] Stripped cache_control from system field")
+        
+        # Strip cache_control from messages
+        if "messages" in body:
+            original_messages = json.dumps(body["messages"])
+            body["messages"] = strip_cache_control(body["messages"])
+            if original_messages != json.dumps(body["messages"]):
+                logging.info(f"[{request_id}] Stripped cache_control from messages")
+        
+        # Strip cache_control from tools (Claude Code sends cache_control in tools that Bedrock doesn't support)
+        if "tools" in body:
+            original_tools = json.dumps(body["tools"])
+            body["tools"] = strip_cache_control(body["tools"])
+            if original_tools != json.dumps(body["tools"]):
+                logging.info(f"[{request_id}] Stripped cache_control from tools")
+
+        # Remove 'custom' field from tools (Bedrock doesn't support custom fields in tools)
+        if "tools" in body and isinstance(body["tools"], list):
+            for tool in body["tools"]:
+                if isinstance(tool, dict) and "custom" in tool:
+                    tool.pop("custom", None)
+                    logging.info(f"[{request_id}] Removed 'custom' field from tool: {tool.get('name', 'unknown')}")
 
         # Remove unsupported fields inside tools for Bedrock
         tools_list = body.get("tools")

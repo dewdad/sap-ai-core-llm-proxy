@@ -235,3 +235,6 @@ config.json
 key.pem
 cert.pem
 *.json
+
+# Integration test sync marker
+.last_sync_hash

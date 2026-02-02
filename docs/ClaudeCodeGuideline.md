@@ -19,7 +19,7 @@ pip install -r requirements.txt
 ```
 
 ### 2. Configure SAP AI Core SDK (Recommended Method)
-The proxy is using sap-ai-sdk-gen Python SDK, you can read the document to get more configuration details.
+The proxy uses `sap-ai-sdk-gen` Python SDK (the actively maintained successor to the deprecated `generative-ai-hub-sdk`). You can read the document to get more configuration details.
 - [SAP AI Core SDK Guideline](https://help.sap.com/doc/generative-ai-hub-sdk/CLOUD/en-US/_reference/README_sphynx.html) 
 
 First, create the AI Core configuration directory:
@@ -165,4 +165,4 @@ The future of enterprise AI development is here. Ready to revolutionize your wor
 
 *💡 **Pro Tip**: The proxy supports load balancing across multiple SAP AI Core deployments for high availability and better performance.*
 
-*🔗 **Learn More**: Check out the [SAP AI Core Guidelines](https://help.sap.com/doc/generative-ai-hub-sdk/CLOUD/en-US/_reference/README_sphynx.html) for advanced configuration options.*
+*🔗 **Learn More**: Check out the [SAP AI Core SDK Documentation](https://help.sap.com/doc/generative-ai-hub-sdk/CLOUD/en-US/_reference/README_sphynx.html) for advanced configuration options. Note: This project uses `sap-ai-sdk-gen` (the successor to `generative-ai-hub-sdk`).*

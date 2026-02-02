@@ -113,7 +113,22 @@ Now it supports the following LLM models
     ```
 
 2. Install the required Python packages:
+
+   **Recommended: Using uv (faster and consistent across platforms)**
     ```sh
+    uv venv
+    uv pip install -r requirements.txt
+    ```
+    This creates a `.venv` directory that works consistently across Windows, Linux, and Mac.
+
+   **Alternative: Using pip**
+    ```sh
+    python -m venv .venv
+    # On Windows
+    .\.venv\Scripts\activate
+    # On Linux/Mac
+    source .venv/bin/activate
+
     pip install -r requirements.txt
     ```
 
@@ -219,7 +234,7 @@ The proxy server provides full compatibility with the Anthropic Claude Messages 
 - **Multi-turn conversations**: Full conversation history support
 
 ### Anthropic Claude Integration with SAP AI Core
-The project is use the official SAP AI SDK (`sap-ai-sdk-gen`) for Anthropic Claude integration. This method provides better compatibility and follows SAP's official guidelines.
+The project uses the official SAP AI SDK (`sap-ai-sdk-gen`) for Anthropic Claude integration. This is the actively maintained successor to the deprecated `generative-ai-hub-sdk`. This method provides better compatibility and follows SAP's official guidelines.
 - https://help.sap.com/doc/generative-ai-hub-sdk/CLOUD/en-US/_reference/README_sphynx.html
 #### Configuration
 1. Create the configuration directory and file:
