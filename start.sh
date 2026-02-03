@@ -6,7 +6,7 @@
 cd "$(dirname "$0")"
 
 # Activate virtual environment
-source .venv/bin/activate
+source venv/bin/activate
 
 # Start the proxy server
 echo "Starting SAP AI Core LLM Proxy on http://127.0.0.1:4337"

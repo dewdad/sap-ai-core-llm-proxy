@@ -31,6 +31,28 @@ _original_from_env = AICoreV2Client.from_env
 # Global variables to store extracted configuration for SDK use
 _extracted_base_url = None
 _extracted_auth_credentials = None
+_aicore_config_cache = None  # Cache for ~/.aicore/config.json to avoid repeated file reads
+
+def _load_aicore_config_cached():
+    """Load and cache ~/.aicore/config.json to avoid repeated file reads."""
+    global _aicore_config_cache
+    
+    if _aicore_config_cache is not None:
+        return _aicore_config_cache
+    
+    try:
+        aicore_config_path = os.path.expanduser("~/.aicore/config.json")
+        if os.path.exists(aicore_config_path):
+            with open(aicore_config_path, 'r') as f:
+                _aicore_config_cache = json.load(f)
+                logging.debug(f"Loaded and cached ~/.aicore/config.json")
+                return _aicore_config_cache
+    except Exception as e:
+        logging.warning(f"Failed to load ~/.aicore/config.json: {e}")
+    
+    _aicore_config_cache = {}  # Empty dict to indicate we tried but found nothing
+    return _aicore_config_cache
+
 
 def _extract_base_url_from_proxy_config():
     """Extract base_url from proxy configuration deployment URLs."""
@@ -99,20 +121,13 @@ def _patched_from_env(profile_name: str = None, **kwargs):
         
         if base_url:
             kwargs['base_url'] = base_url
-            logging.info(f"Injected base_url from proxy config: {base_url}")
+            logging.debug(f"Injected base_url from proxy config: {base_url}")
         else:
-            # If proxy config doesn't have it, try to read from ~/.aicore/config.json
-            try:
-                import os
-                aicore_config_path = os.path.expanduser("~/.aicore/config.json")
-                if os.path.exists(aicore_config_path):
-                    with open(aicore_config_path, 'r') as f:
-                        aicore_config = json.load(f)
-                        if 'AICORE_BASE_URL' in aicore_config:
-                            kwargs['base_url'] = aicore_config['AICORE_BASE_URL']
-                            logging.info(f"Injected base_url from ~/.aicore/config.json: {kwargs['base_url']}")
-            except Exception as e:
-                logging.warning(f"Failed to read base_url from ~/.aicore/config.json: {e}")
+            # If proxy config doesn't have it, try to read from cached ~/.aicore/config.json
+            aicore_config = _load_aicore_config_cached()
+            if aicore_config and 'AICORE_BASE_URL' in aicore_config:
+                kwargs['base_url'] = aicore_config['AICORE_BASE_URL']
+                logging.debug(f"Injected base_url from cached ~/.aicore/config.json")
 
     # If still no base_url, log a warning
     if 'base_url' not in kwargs:
@@ -129,32 +144,26 @@ def _patched_from_env(profile_name: str = None, **kwargs):
         if auth_creds:
             if 'auth_url' not in kwargs and auth_creds.get('auth_url'):
                 kwargs['auth_url'] = auth_creds['auth_url']
-                logging.info(f"Injected auth_url from proxy config")
+                logging.debug("Injected auth_url from proxy config")
             if 'client_id' not in kwargs and auth_creds.get('client_id'):
                 kwargs['client_id'] = auth_creds['client_id']
-                logging.info(f"Injected client_id from proxy config")
+                logging.debug("Injected client_id from proxy config")
             if 'client_secret' not in kwargs and auth_creds.get('client_secret'):
                 kwargs['client_secret'] = auth_creds['client_secret']
-                logging.info(f"Injected client_secret from proxy config")
+                logging.debug("Injected client_secret from proxy config")
         else:
-            # If proxy config doesn't have it, try to read from ~/.aicore/config.json
-            try:
-                import os
-                aicore_config_path = os.path.expanduser("~/.aicore/config.json")
-                if os.path.exists(aicore_config_path):
-                    with open(aicore_config_path, 'r') as f:
-                        aicore_config = json.load(f)
-                        if 'auth_url' not in kwargs and 'AICORE_AUTH_URL' in aicore_config:
-                            kwargs['auth_url'] = aicore_config['AICORE_AUTH_URL']
-                            logging.info(f"Injected auth_url from ~/.aicore/config.json")
-                        if 'client_id' not in kwargs and 'AICORE_CLIENT_ID' in aicore_config:
-                            kwargs['client_id'] = aicore_config['AICORE_CLIENT_ID']
-                            logging.info(f"Injected client_id from ~/.aicore/config.json")
-                        if 'client_secret' not in kwargs and 'AICORE_CLIENT_SECRET' in aicore_config:
-                            kwargs['client_secret'] = aicore_config['AICORE_CLIENT_SECRET']
-                            logging.info(f"Injected client_secret from ~/.aicore/config.json")
-            except Exception as e:
-                logging.warning(f"Failed to read auth credentials from ~/.aicore/config.json: {e}")
+            # If proxy config doesn't have it, try to read from cached ~/.aicore/config.json
+            aicore_config = _load_aicore_config_cached()
+            if aicore_config:
+                if 'auth_url' not in kwargs and 'AICORE_AUTH_URL' in aicore_config:
+                    kwargs['auth_url'] = aicore_config['AICORE_AUTH_URL']
+                    logging.debug("Injected auth_url from cached ~/.aicore/config.json")
+                if 'client_id' not in kwargs and 'AICORE_CLIENT_ID' in aicore_config:
+                    kwargs['client_id'] = aicore_config['AICORE_CLIENT_ID']
+                    logging.debug("Injected client_id from cached ~/.aicore/config.json")
+                if 'client_secret' not in kwargs and 'AICORE_CLIENT_SECRET' in aicore_config:
+                    kwargs['client_secret'] = aicore_config['AICORE_CLIENT_SECRET']
+                    logging.debug("Injected client_secret from cached ~/.aicore/config.json")
 
     # Log warning if authentication credentials are still missing
     if 'auth_url' not in kwargs or 'client_id' not in kwargs or 'client_secret' not in kwargs:
@@ -299,8 +308,11 @@ def get_sapaicore_sdk_session() -> Session:
     if _sdk_session is None:
         with _sdk_session_lock:
             if _sdk_session is None:
-                logging.info("Initializing global SAP AI SDK Session")
+                start_time = time.time()
+                logging.info("Initializing global SAP AI SDK Session...")
                 _sdk_session = Session()
+                elapsed = time.time() - start_time
+                logging.info(f"SAP AI SDK Session initialized in {elapsed:.2f} seconds")
     return _sdk_session
 
 def get_sapaicore_sdk_client(model_name: str):
@@ -311,10 +323,71 @@ def get_sapaicore_sdk_client(model_name: str):
     with _bedrock_clients_lock:
         client = _bedrock_clients.get(model_name)
         if client is None:
-            logging.info(f"Creating SAP AI SDK client for model '{model_name}'")
+            start_time = time.time()
+            logging.info(f"Creating SAP AI SDK client for model '{model_name}'...")
             client = get_sapaicore_sdk_session().client(model_name=model_name)
             _bedrock_clients[model_name] = client
+            elapsed = time.time() - start_time
+            logging.info(f"SAP AI SDK client for model '{model_name}' created in {elapsed:.2f} seconds")
     return client
+
+
+def warmup_sdk():
+    """Pre-initialize SAP AI SDK Session and clients at startup to avoid first-request latency.
+    
+    This function should be called after the proxy configuration is loaded to ensure
+    the SDK is ready to handle requests immediately without cold-start delays.
+    """
+    total_start = time.time()
+    logging.info("=" * 60)
+    logging.info("Starting SDK warmup to reduce first-request latency...")
+    logging.info("=" * 60)
+    
+    try:
+        # Step 1: Initialize the SDK Session (most expensive operation)
+        logging.info("[Warmup 1/3] Initializing SAP AI SDK Session...")
+        session = get_sapaicore_sdk_session()
+        logging.info("[Warmup 1/3] SDK Session ready")
+        
+        # Step 2: Find Claude models to pre-warm (they use the SDK)
+        claude_models = []
+        for model_name in proxy_config.model_to_subaccounts.keys():
+            if is_claude_model(model_name):
+                claude_models.append(model_name)
+        
+        if claude_models:
+            logging.info(f"[Warmup 2/3] Found {len(claude_models)} Claude models to pre-warm: {', '.join(claude_models[:5])}{'...' if len(claude_models) > 5 else ''}")
+            
+            # Pre-warm the first Claude model (usually enough to initialize SDK internals)
+            # We only warm up one model to keep startup time reasonable
+            first_model = claude_models[0]
+            logging.info(f"[Warmup 2/3] Pre-creating SDK client for model '{first_model}'...")
+            get_sapaicore_sdk_client(first_model)
+            logging.info(f"[Warmup 2/3] SDK client for '{first_model}' ready")
+        else:
+            logging.info("[Warmup 2/3] No Claude models found - skipping client pre-warm")
+        
+        # Step 3: Pre-fetch authentication tokens for all subaccounts
+        logging.info("[Warmup 3/3] Pre-fetching authentication tokens...")
+        for subaccount_name in proxy_config.subaccounts.keys():
+            try:
+                token_start = time.time()
+                fetch_token(subaccount_name)
+                token_elapsed = time.time() - token_start
+                logging.info(f"[Warmup 3/3] Token for '{subaccount_name}' fetched in {token_elapsed:.2f}s")
+            except Exception as e:
+                logging.warning(f"[Warmup 3/3] Failed to pre-fetch token for '{subaccount_name}': {e}")
+        
+        total_elapsed = time.time() - total_start
+        logging.info("=" * 60)
+        logging.info(f"SDK warmup completed in {total_elapsed:.2f} seconds")
+        logging.info("First requests should now be fast!")
+        logging.info("=" * 60)
+        
+    except Exception as e:
+        total_elapsed = time.time() - total_start
+        logging.error(f"SDK warmup failed after {total_elapsed:.2f}s: {e}", exc_info=True)
+        logging.warning("First requests may experience higher latency due to warmup failure")
 
 @app.route('/v1/embeddings', methods=['POST'])
 def handle_embedding_request():
@@ -589,26 +662,42 @@ def fetch_token(subaccount_name: str) -> str:
             subaccount.token_info.expiry = 0
             raise RuntimeError(f"Unexpected error processing token response for '{subaccount_name}': {err}") from err
 
+# Cached set for O(1) token lookup - populated on first use
+_auth_tokens_set = None
+
+def _get_auth_tokens_set():
+    """Get or create a set of authentication tokens for fast lookup."""
+    global _auth_tokens_set
+    if _auth_tokens_set is None:
+        _auth_tokens_set = set(proxy_config.secret_authentication_tokens)
+    return _auth_tokens_set
+
+
 def verify_request_token(request):
     """Verifies the Authorization or x-api-key header from the incoming client request."""
     token = request.headers.get("Authorization") or request.headers.get("x-api-key")
-    logging.info(f"verify_request_token, Token received in request: {token[:15]}..." if token and len(token) > 15 else token)
+    # Only log token info at DEBUG level to reduce overhead
+    logging.debug(f"verify_request_token, Token received: {token[:15]}..." if token and len(token) > 15 else f"verify_request_token, Token: {token}")
 
     if not proxy_config.secret_authentication_tokens:
-        logging.warning("Client authentication disabled - no tokens configured.")
+        logging.debug("Client authentication disabled - no tokens configured.")
         return True
 
     if not token:
-        logging.error("Missing token in request. Checked Authorization and x-api-key headers.")
+        logging.warning("Missing token in request. Checked Authorization and x-api-key headers.")
         return False
 
+    # Use cached set for faster lookup
+    auth_tokens = _get_auth_tokens_set()
+    
     # The check `secret_key in token` handles both "Bearer <token>" and just "<token>"
-    if not any(secret_key in token for secret_key in proxy_config.secret_authentication_tokens):
-        logging.error("Invalid token - no matching token found.")
-        return False
-
-    logging.debug("Client token verified successfully.")
-    return True
+    for secret_key in auth_tokens:
+        if secret_key in token:
+            logging.debug("Client token verified successfully.")
+            return True
+    
+    logging.warning("Invalid token - no matching token found.")
+    return False
 
 def convert_openai_to_claude(payload):
     # Extract system message if present
@@ -2330,39 +2419,36 @@ def proxy_claude_request():
         # Error: "system.2.cache_control.ephemeral.scope: Extra inputs are not permitted"
         # =====================================================================
         def strip_cache_control(obj):
-            """Recursively strip cache_control fields from dicts and lists."""
+            """Recursively strip cache_control fields from dicts and lists.
+            Returns tuple of (modified_obj, was_modified) for efficiency."""
             if isinstance(obj, dict):
-                # Remove cache_control key if present
+                modified = "cache_control" in obj
                 obj.pop("cache_control", None)
                 # Recursively process all values
                 for key, value in list(obj.items()):
-                    obj[key] = strip_cache_control(value)
-                return obj
+                    new_value, child_modified = strip_cache_control(value)
+                    obj[key] = new_value
+                    modified = modified or child_modified
+                return obj, modified
             elif isinstance(obj, list):
-                return [strip_cache_control(item) for item in obj]
+                modified = False
+                for i, item in enumerate(obj):
+                    obj[i], child_modified = strip_cache_control(item)
+                    modified = modified or child_modified
+                return obj, modified
             else:
-                return obj
+                return obj, False
         
-        # Strip cache_control from system field (can be string or list of dicts)
-        if "system" in body:
-            original_system = body["system"]
-            body["system"] = strip_cache_control(body["system"])
-            if original_system != body["system"]:
-                logging.info(f"[{request_id}] Stripped cache_control from system field")
+        # Strip cache_control from system, messages, and tools in a single pass
+        fields_modified = []
+        for field in ["system", "messages", "tools"]:
+            if field in body:
+                body[field], was_modified = strip_cache_control(body[field])
+                if was_modified:
+                    fields_modified.append(field)
         
-        # Strip cache_control from messages
-        if "messages" in body:
-            original_messages = json.dumps(body["messages"])
-            body["messages"] = strip_cache_control(body["messages"])
-            if original_messages != json.dumps(body["messages"]):
-                logging.info(f"[{request_id}] Stripped cache_control from messages")
-        
-        # Strip cache_control from tools (Claude Code sends cache_control in tools that Bedrock doesn't support)
-        if "tools" in body:
-            original_tools = json.dumps(body["tools"])
-            body["tools"] = strip_cache_control(body["tools"])
-            if original_tools != json.dumps(body["tools"]):
-                logging.info(f"[{request_id}] Stripped cache_control from tools")
+        if fields_modified:
+            logging.debug(f"[{request_id}] Stripped cache_control from: {', '.join(fields_modified)}")
 
         # Remove 'custom' field from tools (Bedrock doesn't support custom fields in tools)
         if "tools" in body and isinstance(body["tools"], list):
@@ -3410,6 +3496,9 @@ if __name__ == '__main__':
     maintenance_thread = threading.Thread(target=maintain_connection_pool, daemon=True)
     maintenance_thread.start()
     logging.info("Started connection pool maintenance thread")
+
+    # Warm up the SDK to reduce first-request latency
+    ##warmup_sdk()
 
     # Try to use waitress if available (production server)
     # Otherwise fall back to Flask dev server with thread limiting
