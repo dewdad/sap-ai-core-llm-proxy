@@ -1078,6 +1078,162 @@ def verify_request_token(request):
     logging.warning("Invalid token - no matching token found.")
     return False
 
+
+# Supported image formats for AWS Bedrock Converse API
+_SUPPORTED_IMAGE_FORMATS = {"png", "jpeg", "jpg", "gif", "webp"}
+
+# Map content-type to Bedrock image format
+_CONTENT_TYPE_TO_FORMAT = {
+    "image/png": "png",
+    "image/jpeg": "jpeg",
+    "image/jpg": "jpeg",
+    "image/gif": "gif",
+    "image/webp": "webp",
+}
+
+
+def _convert_image_url_to_converse(image_url: str) -> Optional[dict]:
+    """Convert an OpenAI image_url to AWS Bedrock Converse API content block.
+    
+    Handles:
+    - data:image/* URLs → Converse image block
+    - data:application/pdf URLs → Converse document block
+    - http(s) URLs → downloads and converts to image block
+    
+    Args:
+        image_url: The URL from OpenAI's image_url content block.
+                   Either 'data:image/png;base64,...', 'data:application/pdf;base64,...',
+                   or 'https://...'
+    
+    Returns:
+        A Bedrock Converse image or document content block dict, or None on failure.
+    """
+    if not image_url:
+        logging.warning("[Vision] Empty image URL")
+        return None
+    
+    if image_url.startswith("data:"):
+        # Check if it's a PDF before treating as image
+        if image_url.startswith("data:application/pdf"):
+            return _parse_data_url_pdf(image_url)
+        return _parse_data_url_image(image_url)
+    elif image_url.startswith(("http://", "https://")):
+        return _download_and_convert_image(image_url)
+    else:
+        logging.warning(f"[Vision] Unsupported image URL scheme: {image_url[:80]}")
+        return None
+
+
+def _parse_data_url_image(data_url: str) -> Optional[dict]:
+    """Parse a data: URL into Bedrock Converse image format."""
+    try:
+        header, data = data_url.split(",", 1)
+        media_type = header.split(";")[0].split(":")[1]  # e.g., "image/png"
+        image_format = _CONTENT_TYPE_TO_FORMAT.get(media_type, "png")
+        
+        converse_image = {
+            "image": {
+                "format": image_format,
+                "source": {
+                    "bytes": data
+                }
+            }
+        }
+        logging.info(f"[Vision] Converted data URL to Converse format: {image_format}")
+        return converse_image
+    except Exception as e:
+        logging.error(f"[Vision] Failed to parse data URL: {e}")
+        return None
+
+
+def _parse_data_url_pdf(data_url: str) -> Optional[dict]:
+    """Parse a data:application/pdf URL into Bedrock Converse document format."""
+    try:
+        header, data = data_url.split(",", 1)
+        
+        converse_doc = {
+            "document": {
+                "format": "pdf",
+                "name": "uploaded_document",
+                "source": {
+                    "bytes": data
+                }
+            }
+        }
+        size_kb = len(data) * 3 / 4 / 1024  # Approximate decoded size
+        logging.info(f"[Vision] Converted PDF data URL to Converse document format (~{size_kb:.1f}KB)")
+        return converse_doc
+    except Exception as e:
+        logging.error(f"[Vision] Failed to parse PDF data URL: {e}")
+        return None
+
+
+def _download_and_convert_image(url: str) -> Optional[dict]:
+    """Download an image from a URL and convert to Bedrock Converse format.
+    
+    Downloads the image, determines format from Content-Type header or URL
+    extension, and base64-encodes the bytes.
+    """
+    try:
+        logging.info(f"[Vision] Downloading image from: {url[:120]}")
+        # Use a standard User-Agent to avoid 403s from CDNs/wikis that block bare requests
+        download_headers = {
+            "User-Agent": "SAP-AI-Core-LLM-Proxy/1.0 (Image Fetch)"
+        }
+        response = _http_session.get(url, headers=download_headers, timeout=15, stream=False)
+        response.raise_for_status()
+        
+        image_bytes = response.content
+        response.close()
+        
+        if not image_bytes:
+            logging.warning(f"[Vision] Downloaded empty image from: {url[:120]}")
+            return None
+        
+        # Determine format from Content-Type header
+        content_type = response.headers.get("Content-Type", "").lower().split(";")[0].strip()
+        image_format = _CONTENT_TYPE_TO_FORMAT.get(content_type)
+        
+        # Fallback: infer from URL extension
+        if not image_format:
+            url_path = url.split("?")[0].split("#")[0].lower()
+            for ext in _SUPPORTED_IMAGE_FORMATS:
+                if url_path.endswith(f".{ext}"):
+                    image_format = "jpeg" if ext == "jpg" else ext
+                    break
+        
+        # Default to png if we can't determine
+        if not image_format:
+            image_format = "png"
+            logging.debug(f"[Vision] Could not determine image format from Content-Type '{content_type}' or URL, defaulting to png")
+        
+        # Base64-encode
+        encoded = base64.b64encode(image_bytes).decode("utf-8")
+        
+        converse_image = {
+            "image": {
+                "format": image_format,
+                "source": {
+                    "bytes": encoded
+                }
+            }
+        }
+        
+        size_kb = len(image_bytes) / 1024
+        logging.info(f"[Vision] Downloaded and converted image: {image_format}, {size_kb:.1f}KB")
+        return converse_image
+        
+    except requests.exceptions.Timeout:
+        logging.error(f"[Vision] Timeout downloading image from: {url[:120]}")
+        return None
+    except requests.RequestException as e:
+        logging.error(f"[Vision] Failed to download image from {url[:120]}: {e}")
+        return None
+    except Exception as e:
+        logging.error(f"[Vision] Unexpected error processing image URL: {e}")
+        return None
+
+
 def convert_openai_to_claude(payload):
     # Extract system message if present
     system_message = ""
@@ -1163,34 +1319,42 @@ def convert_openai_to_claude37(payload):
                         elif isinstance(item, str):
                              # Convert string item to block format
                             validated_content.append({"text": item})
+                        elif isinstance(item, dict) and item.get("type") == "text":
+                            # OpenAI-style text block: {"type": "text", "text": "..."}
+                            validated_content.append({"text": item.get("text", "")})
                         elif isinstance(item, dict) and item.get("type") == "image_url":
-                            # Convert OpenAI image_url format to AWS Bedrock Converse image format
+                            # Convert OpenAI image_url format to AWS Bedrock Converse image/document format
                             image_url = item.get("image_url", {}).get("url", "")
-                            if image_url.startswith("data:"):
-                                # Parse data URL format: data:image/png;base64,<data>
-                                try:
-                                    header, data = image_url.split(",", 1)
-                                    media_type = header.split(";")[0].split(":")[1]  # e.g., "image/png"
-                                    # Extract format (png, jpeg, gif, webp) from media type
-                                    image_format = media_type.split("/")[1] if "/" in media_type else "png"
-
-                                    # AWS Bedrock Converse API format
-                                    converse_image = {
-                                        "image": {
-                                            "format": image_format,
-                                            "source": {
-                                                "bytes": data
-                                            }
-                                        }
+                            converse_block = _convert_image_url_to_converse(image_url)
+                            if converse_block:
+                                validated_content.append(converse_block)
+                        elif isinstance(item, dict) and item.get("type") == "file":
+                            # Anthropic-native file block: {"type": "file", "source": {"type": "base64", "media_type": "application/pdf", "data": "..."}}
+                            source = item.get("source", {})
+                            media_type = source.get("media_type", "")
+                            file_data = source.get("data", "")
+                            if media_type == "application/pdf" and file_data:
+                                validated_content.append({
+                                    "document": {
+                                        "format": "pdf",
+                                        "name": item.get("filename", "uploaded_document"),
+                                        "source": {"bytes": file_data}
                                     }
-                                    validated_content.append(converse_image)
-                                    logging.info(f"Converted image_url to AWS Bedrock Converse format with format: {image_format}")
-                                except Exception as e:
-                                    logging.error(f"Failed to parse image data URL: {e}")
+                                })
+                                logging.info(f"[Vision] Converted Anthropic file block to Converse document format")
+                            elif media_type.startswith("image/") and file_data:
+                                image_format = _CONTENT_TYPE_TO_FORMAT.get(media_type, "png")
+                                validated_content.append({
+                                    "image": {
+                                        "format": image_format,
+                                        "source": {"bytes": file_data}
+                                    }
+                                })
+                                logging.info(f"[Vision] Converted Anthropic file block to Converse image format: {image_format}")
                             else:
-                                logging.warning(f"Unsupported image_url format (only data URLs supported): {image_url[:100]}")
+                                logging.warning(f"[Vision] Unsupported file type in Anthropic file block: {media_type}")
                         else:
-                            logging.warning(f"Skipping invalid content block for role {role}: {item}")
+                            logging.warning(f"Skipping invalid content block for role {role}: {str(item)[:200]}")
                     
                     if validated_content:
                         converted_messages.append({
@@ -2592,18 +2756,29 @@ def handle_default_request(payload, model="gpt-4o"):
         except ValueError:
             raise ValueError(f"No valid model found for '{model}' or fallback in any subAccount")
 
-    # Determine API version based on model
-    if any(m in model for m in ["o3", "o4-mini", "o3-mini"]):
+    # Determine API version and parameter compatibility based on model
+    # Newer models (GPT-5, o3, o4-mini, gpt-4.1) require the preview API version
+    # and use max_completion_tokens instead of max_tokens
+    _newer_api_models = ["gpt-5", "o3", "o4-mini", "o3-mini", "gpt-4.1"]
+    needs_newer_api = any(m in model for m in _newer_api_models)
+    
+    modified_payload = payload.copy()
+    
+    if needs_newer_api:
         api_version = "2024-12-01-preview"
-        # Remove unsupported parameters for o3-mini
-        modified_payload = payload.copy()
-        if 'temperature' in modified_payload:
-            logging.info(f"Removing 'temperature' parameter for o3-mini model.")
-            del modified_payload['temperature']
-        # Add checks for other potentially unsupported parameters if needed
+        
+        # Convert max_tokens → max_completion_tokens (required by newer models)
+        if 'max_tokens' in modified_payload:
+            modified_payload['max_completion_tokens'] = modified_payload.pop('max_tokens')
+            logging.info(f"Converted max_tokens → max_completion_tokens for model '{model}'")
+        
+        # Remove temperature for reasoning models (o3, o4-mini, o3-mini)
+        if any(m in model for m in ["o3", "o4-mini", "o3-mini"]):
+            if 'temperature' in modified_payload:
+                logging.info(f"Removing 'temperature' parameter for reasoning model '{model}'.")
+                del modified_payload['temperature']
     else:
         api_version = "2023-05-15"
-        modified_payload = payload.copy()
 
     # Remove reasoning-related parameters for GPT models
     # These parameters are Claude-specific and not supported by OpenAI GPT models
