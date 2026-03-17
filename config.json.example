@@ -1,24 +1,10 @@
 {
     "subAccounts": {
-        "subAccount1": {
+        "autoDiscoverAccount": {
             "resource_group": "default",
-            "service_key_json": "subAccount1_service_key.json",
-            "deployment_models": {
-                "gpt-4o": [
-                    "https://api.ai.intprod-eu12.eu-central-1.aws.ml.hana.ondemand.com/v2/inference/deployments/<deployment_id_1>"
-                ],
-                "3.7-sonnet": [
-                    "https://api.ai.intprod-eu12.eu-central-1.aws.ml.hana.ondemand.com/v2/inference/deployments/<deployment_id_3>"
-                ],
-                "3.5-sonnet": [
-                    "https://api.ai.intprod-eu12.eu-central-1.aws.ml.hana.ondemand.com/v2/inference/deployments/<deployment_id_4>"
-                ],
-                "gpt-o3-mini": [
-                    "https://api.ai.intprod-eu12.eu-central-1.aws.ml.hana.ondemand.com/v2/inference/deployments/<deployment_id_5>"
-                ]
-            }
+            "service_key_json": "service_key.json"
         },
-        "subAccount2": {
+        "staticAccount": {
             "resource_group": "default",
             "service_key_json": "subAccount2_service_key.json",
             "deployment_models": {
@@ -27,12 +13,6 @@
                 ],
                 "3.7-sonnet": [
                     "https://api.ai.intprod-eu12.eu-central-1.aws.ml.hana.ondemand.com/v2/inference/deployments/<deployment_id_7>"
-                ],
-                "3.5-sonnet": [
-                    "https://api.ai.intprod-eu12.eu-central-1.aws.ml.hana.ondemand.com/v2/inference/deployments/<deployment_id_8>"
-                ],
-                "gpt-o3-mini": [
-                    "https://api.ai.intprod-eu12.eu-central-1.aws.ml.hana.ondemand.com/v2/inference/deployments/<deployment_id_9>"
                 ]
             }
         }
@@ -41,6 +21,7 @@
         "<authentication_token_1>",
         "<authentication_token_2>"
     ],
+    "discovery_refresh_interval_seconds": 300,
     "port": 3001,
     "host": "0.0.0.0"
 }
