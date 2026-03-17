@@ -55,23 +55,27 @@ def _load_aicore_config_cached():
 
 
 def _extract_base_url_from_proxy_config():
-    """Extract base_url from proxy configuration deployment URLs."""
+    """Extract base_url from proxy configuration deployment URLs or service key."""
     global _extracted_base_url
     
     if _extracted_base_url:
         return _extracted_base_url
     
     try:
-        # Look for a base_url from the first available subaccount's deployment URLs
         for subaccount in proxy_config.subaccounts.values():
-            # Get deployment URLs from the subaccount
+            # Strategy 1: Use ai_api_url from service key (works for auto-discovered configs)
+            if subaccount.service_key and subaccount.service_key.ai_api_url:
+                _extracted_base_url = subaccount.service_key.ai_api_url
+                logging.info(f"Extracted base_url from service key: {_extracted_base_url}")
+                return _extracted_base_url
+            
+            # Strategy 2: Extract from deployment URLs (original approach)
             deployment_urls = []
             for urls in subaccount.deployment_models.values():
                 if urls:
                     deployment_urls.extend(urls)
 
             if deployment_urls:
-                # Extract base URL from deployment URL
                 # Deployment URL format: https://api.ai.xxx.cfapps.sap.hana.ondemand.com/v2/inference/deployments/xxx
                 # We need: https://api.ai.xxx.cfapps.sap.hana.ondemand.com/v2
                 deployment_url = deployment_urls[0]
@@ -181,6 +185,7 @@ class ServiceKey:
     clientsecret: str
     url: str
     identityzoneid: str
+    ai_api_url: Optional[str] = None  # From serviceurls.AI_API_URL in key file
 
 @dataclass
 class TokenInfo:
@@ -194,6 +199,7 @@ class SubAccountConfig:
     resource_group: str
     service_key_json: str
     deployment_models: Dict[str, List[str]]
+    auto_discovered: bool = False  # True if deployment_models was auto-discovered
     service_key: Optional[ServiceKey] = None
     token_info: TokenInfo = field(default_factory=TokenInfo)
     normalized_models: Dict[str, List[str]] = field(default_factory=dict)
@@ -205,7 +211,8 @@ class SubAccountConfig:
             clientid=key_data.get('clientid'),
             clientsecret=key_data.get('clientsecret'),
             url=key_data.get('url'),
-            identityzoneid=key_data.get('identityzoneid')
+            identityzoneid=key_data.get('identityzoneid'),
+            ai_api_url=key_data.get('serviceurls', {}).get('AI_API_URL')
         )
         
     def normalize_model_names(self):
@@ -218,13 +225,33 @@ class ProxyConfig:
     secret_authentication_tokens: List[str] = field(default_factory=list)
     port: int = 3001
     host: str = "127.0.0.1"
+    discovery_refresh_interval_seconds: int = 300  # Background refresh interval (0 = disabled)
     # Global model to subaccount mapping for load balancing
     model_to_subaccounts: Dict[str, List[str]] = field(default_factory=dict)
+    # Lock for thread-safe updates to model mappings during background refresh
+    _mapping_lock: threading.Lock = field(default_factory=threading.Lock)
     
     def initialize(self):
-        """Initialize all subaccounts and build model mappings"""
+        """Initialize all subaccounts and build model mappings.
+        
+        For subaccounts without deployment_models configured, automatically
+        discovers available deployments from SAP AI Core.
+        """
         for subaccount in self.subaccounts.values():
             subaccount.load_service_key()
+            
+            # Auto-discover deployments if deployment_models is empty
+            if not subaccount.deployment_models:
+                logging.info(f"No deployment_models configured for subAccount '{subaccount.name}' — starting auto-discovery...")
+                try:
+                    discovered = discover_deployments(subaccount)
+                    subaccount.deployment_models = discovered
+                    subaccount.auto_discovered = True
+                    logging.info(f"Auto-discovered {len(discovered)} model(s) for subAccount '{subaccount.name}': {', '.join(discovered.keys())}")
+                except Exception as e:
+                    logging.error(f"Failed to auto-discover deployments for subAccount '{subaccount.name}': {e}")
+                    logging.warning(f"SubAccount '{subaccount.name}' will have no models available")
+            
             subaccount.normalize_model_names()
             
         # Build model to subaccounts mapping for load balancing
@@ -232,16 +259,363 @@ class ProxyConfig:
     
     def build_model_mapping(self):
         """Build a mapping of models to the subaccounts that have them"""
-        self.model_to_subaccounts = {}
+        new_mapping = {}
         for subaccount_name, subaccount in self.subaccounts.items():
             for model in subaccount.normalized_models.keys():
-                if model not in self.model_to_subaccounts:
-                    self.model_to_subaccounts[model] = []
-                self.model_to_subaccounts[model].append(subaccount_name)
+                if model not in new_mapping:
+                    new_mapping[model] = []
+                new_mapping[model].append(subaccount_name)
+        with self._mapping_lock:
+            self.model_to_subaccounts = new_mapping
+    
+    def refresh_discovered_deployments(self):
+        """Re-discover deployments for all auto-discovered subaccounts.
+        
+        Called by the background refresh thread. Thread-safe — updates
+        model mappings atomically.
+        """
+        any_changed = False
+        for subaccount in self.subaccounts.values():
+            if not subaccount.auto_discovered:
+                continue
+            try:
+                discovered = discover_deployments(subaccount)
+                old_models = set(subaccount.deployment_models.keys())
+                new_models = set(discovered.keys())
+                
+                added = new_models - old_models
+                removed = old_models - new_models
+                
+                if added or removed:
+                    any_changed = True
+                    if added:
+                        logging.info(f"[Discovery Refresh] New models in '{subaccount.name}': {', '.join(added)}")
+                    if removed:
+                        logging.info(f"[Discovery Refresh] Removed models in '{subaccount.name}': {', '.join(removed)}")
+                    
+                    subaccount.deployment_models = discovered
+                    subaccount.normalize_model_names()
+                else:
+                    logging.debug(f"[Discovery Refresh] No changes for subAccount '{subaccount.name}' ({len(discovered)} models)")
+                    
+            except Exception as e:
+                logging.error(f"[Discovery Refresh] Failed to refresh subAccount '{subaccount.name}': {e}")
+        
+        if any_changed:
+            self.build_model_mapping()
+            logging.info(f"[Discovery Refresh] Updated model mappings. Available models: {', '.join(self.model_to_subaccounts.keys())}")
 
 
 # Global configuration
 proxy_config = ProxyConfig()
+
+
+# ------------------------
+# Deployment Auto-Discovery
+# ------------------------
+
+# Persistent cache: deployment_id → model_name
+# Avoids re-fetching individual deployment details for known deployments.
+# Cache file is written after every discovery run and loaded at startup.
+_DISCOVERY_CACHE_FILE = ".discovery_cache.json"
+_discovery_cache: Dict[str, str] = {}  # deployment_id → model_name
+_discovery_cache_lock = threading.Lock()
+
+
+def _load_discovery_cache():
+    """Load the deployment_id → model_name cache from disk."""
+    global _discovery_cache
+    try:
+        if os.path.exists(_DISCOVERY_CACHE_FILE):
+            with open(_DISCOVERY_CACHE_FILE, 'r') as f:
+                data = json.load(f)
+            # Validate structure
+            if isinstance(data, dict) and all(isinstance(k, str) and isinstance(v, str) for k, v in data.items()):
+                _discovery_cache = data
+                logging.info(f"[Discovery Cache] Loaded {len(_discovery_cache)} cached deployment→model mappings from {_DISCOVERY_CACHE_FILE}")
+            else:
+                logging.warning(f"[Discovery Cache] Invalid cache format in {_DISCOVERY_CACHE_FILE}, starting fresh")
+                _discovery_cache = {}
+    except (json.JSONDecodeError, OSError) as e:
+        logging.warning(f"[Discovery Cache] Could not load {_DISCOVERY_CACHE_FILE}: {e}")
+        _discovery_cache = {}
+
+
+def _save_discovery_cache():
+    """Persist the deployment_id → model_name cache to disk."""
+    try:
+        with _discovery_cache_lock:
+            with open(_DISCOVERY_CACHE_FILE, 'w') as f:
+                json.dump(_discovery_cache, f, indent=2)
+        logging.debug(f"[Discovery Cache] Saved {len(_discovery_cache)} entries to {_DISCOVERY_CACHE_FILE}")
+    except OSError as e:
+        logging.warning(f"[Discovery Cache] Could not write {_DISCOVERY_CACHE_FILE}: {e}")
+
+
+# Load cache at import time so it's available before first discovery
+_load_discovery_cache()
+
+
+def generate_model_aliases(model_name: str) -> List[str]:
+    """Generate alias names for a model discovered from SAP AI Core.
+    
+    Given a raw model name like 'anthropic--claude-4.5-sonnet', generates:
+    - The original name: 'anthropic--claude-4.5-sonnet'
+    - Without vendor prefix: 'claude-4.5-sonnet'
+    - Short version form: '4.5-sonnet' (for Claude models)
+    
+    For models like 'gpt-5' or 'gemini-2.5-pro', no extra aliases are needed
+    since the raw name is already clean.
+    
+    Returns:
+        List of alias names (always includes the original)
+    """
+    aliases = [model_name]
+    
+    # Strip vendor prefix pattern: 'vendor--model-name' → 'model-name'
+    if '--' in model_name:
+        without_prefix = model_name.split('--', 1)[1]
+        if without_prefix not in aliases:
+            aliases.append(without_prefix)
+        
+        # For Claude models, also generate short version: 'claude-4.5-sonnet' → '4.5-sonnet'
+        if without_prefix.startswith('claude-'):
+            short_name = without_prefix[len('claude-'):]
+            if short_name and short_name not in aliases:
+                aliases.append(short_name)
+    
+    return aliases
+
+
+def _fetch_token_for_discovery(subaccount: SubAccountConfig) -> str:
+    """Fetch an auth token for SAP AI Core management API calls.
+    
+    Similar to fetch_token() but works during initialization before
+    the subaccount is registered in proxy_config. Uses the subaccount's
+    own service key directly.
+    """
+    service_key = subaccount.service_key
+    if not service_key:
+        raise ValueError(f"Service key not loaded for subAccount '{subaccount.name}'")
+    
+    # Check cached token first
+    with subaccount.token_info.lock:
+        now = time.time()
+        if subaccount.token_info.token and now < subaccount.token_info.expiry:
+            return subaccount.token_info.token
+    
+        # Fetch new token
+        auth_string = f"{service_key.clientid}:{service_key.clientsecret}"
+        encoded_auth = base64.b64encode(auth_string.encode()).decode()
+        
+        token_url = f"{service_key.url}/oauth/token?grant_type=client_credentials"
+        headers = {"Authorization": f"Basic {encoded_auth}"}
+        
+        response = requests.post(token_url, headers=headers, timeout=15)
+        response.raise_for_status()
+        
+        token_data = response.json()
+        new_token = token_data.get('access_token')
+        response.close()
+        
+        if not new_token:
+            raise ValueError(f"Empty token received for subAccount '{subaccount.name}'")
+        
+        expires_in = int(token_data.get('expires_in', 14400))
+        subaccount.token_info.token = new_token
+        subaccount.token_info.expiry = now + expires_in - 300
+        
+        return new_token
+
+
+def discover_deployments(subaccount: SubAccountConfig) -> Dict[str, List[str]]:
+    """Discover available model deployments from SAP AI Core for a subaccount.
+    
+    Calls the SAP AI Core Deployments API to list all RUNNING deployments,
+    extracts model names and inference URLs, and generates aliases.
+    
+    Args:
+        subaccount: SubAccountConfig with loaded service_key
+        
+    Returns:
+        Dict mapping model names (including aliases) to lists of deployment URLs.
+        Same shape as the static deployment_models config.
+        
+    Raises:
+        ValueError: If service key is missing required fields
+        ConnectionError: If the SAP AI Core API is unreachable
+    """
+    service_key = subaccount.service_key
+    if not service_key or not service_key.ai_api_url:
+        raise ValueError(
+            f"Service key for subAccount '{subaccount.name}' is missing AI_API_URL. "
+            f"Ensure the service key JSON has 'serviceurls.AI_API_URL'."
+        )
+    
+    base_url = service_key.ai_api_url
+    token = _fetch_token_for_discovery(subaccount)
+    resource_group = subaccount.resource_group
+    
+    # Step 1: List all deployments
+    deployments_url = f"{base_url}/v2/lm/deployments"
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "AI-Resource-Group": resource_group
+    }
+    
+    logging.info(f"[Discovery] Fetching deployments from {deployments_url} (resource_group={resource_group})")
+    
+    try:
+        response = requests.get(deployments_url, headers=headers, timeout=30)
+        response.raise_for_status()
+        deployments = response.json().get('resources', [])
+        response.close()
+    except requests.RequestException as e:
+        raise ConnectionError(f"Failed to list deployments for '{subaccount.name}': {e}") from e
+    
+    logging.info(f"[Discovery] Found {len(deployments)} total deployment(s) for subAccount '{subaccount.name}'")
+    
+    # Step 2: Filter RUNNING deployments and resolve model names (cache-first)
+    deployment_models: Dict[str, List[str]] = {}
+    running_count = 0
+    cache_hits = 0
+    cache_misses = 0
+    
+    for deployment in deployments:
+        status = deployment.get('status')
+        if status != 'RUNNING':
+            continue
+        
+        running_count += 1
+        deployment_id = deployment.get('id')
+        deployment_url = f"{base_url}/v2/inference/deployments/{deployment_id}"
+        
+        # Check persistent cache first
+        model_name = _discovery_cache.get(deployment_id)
+        if model_name:
+            cache_hits += 1
+            logging.debug(f"[Discovery] Cache hit: {deployment_id} → {model_name}")
+        else:
+            cache_misses += 1
+            # Cache miss — fetch model name from API
+            model_name = _extract_model_name(deployment, base_url, token, resource_group, deployment_id)
+            
+            if model_name and model_name != "unknown":
+                # Store in cache for next time
+                with _discovery_cache_lock:
+                    _discovery_cache[deployment_id] = model_name
+            else:
+                logging.warning(f"[Discovery] Could not determine model name for deployment {deployment_id}, skipping")
+                continue
+        
+        logging.debug(f"[Discovery] Found deployment: {model_name} → {deployment_url}")
+        
+        # Generate aliases and register the deployment URL under each
+        aliases = generate_model_aliases(model_name)
+        for alias in aliases:
+            if alias not in deployment_models:
+                deployment_models[alias] = []
+            if deployment_url not in deployment_models[alias]:
+                deployment_models[alias].append(deployment_url)
+    
+    # Prune cache entries for deployments that no longer exist
+    running_ids = {d.get('id') for d in deployments if d.get('status') == 'RUNNING'}
+    stale_ids = set(_discovery_cache.keys()) - running_ids
+    if stale_ids:
+        with _discovery_cache_lock:
+            for stale_id in stale_ids:
+                del _discovery_cache[stale_id]
+        logging.debug(f"[Discovery] Pruned {len(stale_ids)} stale cache entries")
+    
+    # Persist cache to disk
+    _save_discovery_cache()
+    
+    logging.info(
+        f"[Discovery] {running_count} RUNNING deployment(s), mapped to {len(deployment_models)} model name(s) "
+        f"(cache: {cache_hits} hits, {cache_misses} misses)"
+    )
+    return deployment_models
+
+
+def _extract_model_name(deployment: dict, base_url: str, token: str, 
+                        resource_group: str, deployment_id: str) -> Optional[str]:
+    """Extract the model name from a deployment, fetching details if necessary.
+    
+    Tries multiple strategies:
+    1. From deployment details.resources.backend_details.model.name  
+    2. From configurationName on the deployment object
+    3. From a detailed GET on the individual deployment
+    """
+    # Strategy 1: Check if model info is already in the deployment list response
+    if 'details' in deployment and 'resources' in deployment.get('details', {}):
+        resources = deployment['details']['resources']
+        if 'backend_details' in resources:
+            backend = resources['backend_details']
+            if 'model' in backend:
+                return backend['model'].get('name')
+    
+    # Strategy 2: Use configurationName as a hint
+    config_name = deployment.get('configurationName', '')
+    
+    # Strategy 3: Fetch individual deployment details
+    try:
+        detail_url = f"{base_url}/v2/lm/deployments/{deployment_id}"
+        headers = {
+            "Authorization": f"Bearer {token}",
+            "AI-Resource-Group": resource_group
+        }
+        response = requests.get(detail_url, headers=headers, timeout=15)
+        response.raise_for_status()
+        details = response.json()
+        response.close()
+        
+        # Try backend_details.model.name from the detailed response
+        if 'details' in details and 'resources' in details.get('details', {}):
+            resources = details['details']['resources']
+            if 'backend_details' in resources:
+                backend = resources['backend_details']
+                if 'model' in backend:
+                    return backend['model'].get('name')
+        
+        # Fall back to configurationName from detailed response
+        detail_config_name = details.get('configurationName', '')
+        if detail_config_name:
+            return detail_config_name
+            
+    except requests.RequestException as e:
+        logging.debug(f"[Discovery] Could not fetch details for deployment {deployment_id}: {e}")
+    
+    # Last resort: use configurationName from list response
+    return config_name if config_name else None
+
+
+def _start_discovery_refresh_thread():
+    """Start a background thread that periodically refreshes auto-discovered deployments."""
+    interval = proxy_config.discovery_refresh_interval_seconds
+    if interval <= 0:
+        logging.info("[Discovery Refresh] Background refresh disabled (interval <= 0)")
+        return
+    
+    # Check if any subaccounts need refreshing
+    has_auto_discovered = any(sa.auto_discovered for sa in proxy_config.subaccounts.values())
+    if not has_auto_discovered:
+        logging.info("[Discovery Refresh] No auto-discovered subaccounts, background refresh not needed")
+        return
+    
+    def _refresh_loop():
+        logging.info(f"[Discovery Refresh] Background thread started (interval={interval}s)")
+        while True:
+            try:
+                time.sleep(interval)
+                logging.info("[Discovery Refresh] Running periodic deployment discovery...")
+                proxy_config.refresh_discovered_deployments()
+            except Exception as e:
+                logging.error(f"[Discovery Refresh] Error in refresh loop: {e}", exc_info=True)
+    
+    thread = threading.Thread(target=_refresh_loop, daemon=True, name="deployment-discovery-refresh")
+    thread.start()
+    logging.info(f"[Discovery Refresh] Started background refresh thread (every {interval}s)")
+
 
 # ------------------------
 # HTTP Session with Connection Pool Management
@@ -545,7 +919,11 @@ token_expiry = 0
 lock = threading.Lock()
 
 def load_config(file_path):
-    """Loads configuration from a JSON file with support for multiple subAccounts."""
+    """Loads configuration from a JSON file with support for multiple subAccounts.
+    
+    When a subAccount omits 'deployment_models' (or sets it to {}), the proxy
+    will auto-discover available deployments from SAP AI Core during initialization.
+    """
     with open(file_path, 'r') as file:
         config_json = json.load(file)
     
@@ -555,7 +933,8 @@ def load_config(file_path):
         proxy_conf = ProxyConfig(
             secret_authentication_tokens=config_json.get('secret_authentication_tokens', []),
             port=config_json.get('port', 3001),
-            host=config_json.get('host', '127.0.0.1')
+            host=config_json.get('host', '127.0.0.1'),
+            discovery_refresh_interval_seconds=config_json.get('discovery_refresh_interval_seconds', 300)
         )
         
         # Parse each subAccount
@@ -3433,7 +3812,15 @@ if __name__ == '__main__':
         
         logging.info(f"Loaded multi-subAccount configuration with {len(proxy_config.subaccounts)} subAccounts")
         logging.info(f"Available subAccounts: {', '.join(proxy_config.subaccounts.keys())}")
-        logging.info(f"Available models: {', '.join(proxy_config.model_to_subaccounts.keys())}")
+        
+        auto_discovered = [name for name, sa in proxy_config.subaccounts.items() if sa.auto_discovered]
+        static_configured = [name for name, sa in proxy_config.subaccounts.items() if not sa.auto_discovered]
+        if auto_discovered:
+            logging.info(f"Auto-discovered subAccounts: {', '.join(auto_discovered)}")
+        if static_configured:
+            logging.info(f"Statically configured subAccounts: {', '.join(static_configured)}")
+        
+        logging.info(f"Available models ({len(proxy_config.model_to_subaccounts)}): {', '.join(proxy_config.model_to_subaccounts.keys())}")
     else:
         # Legacy configuration support
         logging.warning("Using legacy configuration format (single subAccount)")
@@ -3496,6 +3883,9 @@ if __name__ == '__main__':
     maintenance_thread = threading.Thread(target=maintain_connection_pool, daemon=True)
     maintenance_thread.start()
     logging.info("Started connection pool maintenance thread")
+
+    # Start deployment discovery refresh thread (if any subaccounts use auto-discovery)
+    _start_discovery_refresh_thread()
 
     # Warm up the SDK to reduce first-request latency
     ##warmup_sdk()
